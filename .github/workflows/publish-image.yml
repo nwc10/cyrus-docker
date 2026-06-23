@@ -16,8 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ "", "-arm" ]
-        debian: [ bookworm, trixie ]
+        platform: [ "-arm" ]
+        debian: [ trixie, forky ]
     runs-on: ubuntu-24.04${{ matrix.platform }}
 
     permissions:
