@@ -12063,6 +12063,7 @@ Run "dar COMMAND".  Here are some commands:
  • help      - get more information about how to use dar
  • run       - run the given command in the container
  • cyd       - a shortcut for "dar run cyd ..."
+ • clangd    - run the container's clangd as an LSP server on stdio
 
 And these commands all run "dar cyd CMD" in the container:
  • build     - configure and compile Cyrus
@@ -12514,6 +12515,40 @@ sub do_run ($class, $args) {
     $container->{ID},
     @$args,
   );
+}
+
+sub do_clangd ($class, $args) {
+  my $container = $class->_existing_container;
+
+  unless ($container && $container->{State} eq 'running') {
+    die qq{❌ You don't have a running container.  You'll want to run "dar start".\n};
+  }
+
+  run(
+    [ qw( docker exec ), $container->{ID}, qw( sh -c ), 'command -v clangd' ],
+    _emptyref(),
+    _emptyref(),
+    _emptyref(),
+  );
+
+  $? && die qq{❌ This container has no clangd.  Maybe you should "dar pull".\n};
+
+  my $ctx = $class->_repo_context;
+
+  # A worktree is mounted inside the container at the same absolute path
+  # like outside the container. But the main checkout is not. Luckily,
+  # the path-mappings setting allows to support exactly that use case.
+  my @mapping = "$ctx->{toplevel}" eq "$ctx->{clone_root}"
+              ? ()
+              : ("--path-mappings=$ctx->{toplevel}=$ctx->{clone_root}");
+
+  exec(
+    qw( docker exec --interactive --workdir ), $ctx->{clone_root},
+    $container->{ID},
+    'clangd', '--background-index', @mapping, @$args,
+  );
+
+  die "❌ Couldn't exec docker: $!\n";
 }
 
 sub _requested_image ($class, $opt_image) {
