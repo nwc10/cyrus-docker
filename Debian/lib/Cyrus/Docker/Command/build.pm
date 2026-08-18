@@ -29,6 +29,10 @@ sub description {
     build -r      recompile a previous build (skip configure)
     build -n      skip the "make check" step
     build -nr     recompile, skipping both configure and "make check"
+
+  Coverage is the exception to all of that: --cover only instruments what it
+  compiles, so it refuses to build on top of a tree that wasn't compiled for
+  coverage.  Run "clean" first, or use "coverage", which does that for you.
   END
 }
 
@@ -71,9 +75,50 @@ sub opt_spec {
   );
 }
 
+# A Makefile with a GCOV_CFLAGS value is what "--enable-coverage" leaves behind,
+# so it says whether this tree is already a coverage build.
+my sub is_coverage_build ($repo_root) {
+  my $makefile = $repo_root->child('Makefile');
+  return unless $makefile->is_file;
+  return scalar grep {; /\AGCOV_CFLAGS\s*=\s*\S/ } $makefile->lines({ chomp => 1 });
+}
+
+my sub has_objects ($repo_root) {
+  my $state = $repo_root->visit(sub {
+    my ($path, $state) = @_;
+    return unless $path->is_file && $path =~ /\.o\z/;
+
+    # Cassandane's test helpers aren't part of this build, or of any report.
+    return if $path->relative($repo_root) =~ m{\Acassandane/};
+
+    $state->{found} = 1;
+  }, {
+    recurse => 1,
+  });
+
+  return $state->{found};
+}
+
+# Coverage instruments only what it compiles, and enabling it doesn't cause make
+# to rebuild already-compiled object files, so a coverage build starts clean.
+my sub assert_coverage_can_be_complete ($repo_root, $opt) {
+  return if is_coverage_build($repo_root);
+
+  # An empty tree is fine, as long as we're going to configure: -r wouldn't.
+  return unless $opt->recompile || has_objects($repo_root);
+
+  die "Refusing to build with --cover: coverage has to be configured before "
+    . "anything is compiled, and that hasn't happened here.  Build with "
+    . "--cover from a clean tree, without -r.\n";
+}
+
 sub execute ($self, $opt, $args) {
   my $root = $self->app->repo_root;
   chdir $root or die "can't chdir to $root: $!";
+
+  if (($opt->sanitizer // '') eq 'cover') {
+    assert_coverage_can_be_complete($root, $opt);
+  }
 
   $self->configure($opt) unless $opt->recompile;
 
