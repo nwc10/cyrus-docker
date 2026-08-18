@@ -19,6 +19,12 @@ sub description {
     test Quota.quotarename    run one test
     test Admin Quota          run several
     test ~Quota               run everything *except* the Quota suite
+
+  With --cover, on a build made by "build --cover", the tests that ran get
+  their own coverage report.  Stale gcov counters are cleared first, so the
+  report describes just this run.  For example:
+
+    test --cover Quota        report on what the Quota suite covered
   END
 }
 
@@ -34,16 +40,97 @@ sub opt_spec {
     [ 'verbose|v+', "increase verbosity", { default => 0 } ],
     [ 'jobs|j=i', "number of parallel jobs (default: 8) to run for make and testrunner",
                   { default => 8 } ],
+    [],
+    [ 'cover',       "write a coverage report for the tests that ran" ],
+    [ 'cover-dir=s', "where to write the --cover report; default: coverage",
+                     { default => 'coverage' } ],
   );
 }
 
+# "--enable-coverage" is what puts --coverage into GCOV_CFLAGS, so the Makefile
+# is this build's own record of whether it was *configured* for coverage.
+my sub is_coverage_build ($repo_root) {
+  my $makefile = $repo_root->child('Makefile');
+  return unless $makefile->is_file;
+  return scalar grep {; /\AGCOV_CFLAGS\s*=\s*\S/ } $makefile->lines({ chomp => 1 });
+}
+
+# Configuring for coverage isn't the same as having compiled for it: only an
+# instrumented compile writes a .gcno beside the object.
+my sub count_instrumented_objects ($repo_root) {
+  my $state = $repo_root->visit(sub {
+    my ($path, $state) = @_;
+    return unless $path->is_file && $path =~ /\.o\z/;
+
+    # Cassandane compiles its own test helpers on every run, uninstrumented and
+    # not in the report: counting them would refuse every run after the first.
+    return if $path->relative($repo_root) =~ m{\Acassandane/};
+
+    $state->{objects}++;
+    $state->{instrumented}++ if -f ("$path" =~ s/\.o\z/.gcno/r);
+  }, {
+    recurse => 1,
+  });
+
+  return ($state->{objects} // 0, $state->{instrumented} // 0);
+}
+
+# Every object, not most of them: a report that omits uninstrumented code says
+# nothing about what it omitted.
+my sub assert_instrumented_build ($repo_root) {
+  my ($objects, $instrumented) = count_instrumented_objects($repo_root);
+
+  unless ($objects) {
+    die qq{Refusing to run --cover: no object files under $repo_root.  }
+      . qq{Build with --cover first.\n};
+  }
+
+  return if $instrumented == $objects;
+
+  my $missing = $objects - $instrumented;
+
+  die qq{Refusing to run --cover: coverage instrumentation is missing from }
+    . qq{$missing of $objects object files.  Run 'clean', then rebuild with }
+    . qq{--cover.\n};
+}
+
+# gcov counters accumulate across runs.  Without clearing them, a report would
+# also describe whatever ran before: the CUnit tests from the build, or an
+# earlier "test --cover" of some other suite.
+my sub clear_coverage_data ($repo_root) {
+  my $state = $repo_root->visit(sub {
+    my ($path, $state) = @_;
+    return unless $path->is_file && $path =~ /\.gcda\z/;
+    $path->remove;
+    $state->{cleared}++;
+  }, {
+    recurse => 1,
+  });
+
+  say "Cleared gcov counters from $state->{cleared} files."
+    if $state->{cleared};
+}
+
 sub execute ($self, $opt, $args) {
+  my $repo_root = $self->app->repo_root;
+
+  if ($opt->cover) {
+    unless (is_coverage_build($repo_root)) {
+      die "Refusing to run --cover: this build wasn't configured for "
+        . "coverage.  Build with --cover first.\n";
+    }
+
+    assert_instrumented_build($repo_root);
+
+    clear_coverage_data($repo_root);
+  }
+
   unless (-e '/run/rsyslogd.pid') {
     system('/usr/sbin/rsyslogd');
     Process::Status->assert_ok('starting rsyslog');
   }
 
-  my $root = $self->app->repo_root->child('cassandane');
+  my $root = $repo_root->child('cassandane');
   chdir $root or die "can't chdir to $root: $!";
 
   # Cassandane needs a cassandane.ini.  In the image we just drop the canonical
@@ -119,7 +206,23 @@ sub execute ($self, $opt, $args) {
     @$args,
   );
 
-  Process::Status->assert_ok('Cassandane run');
+  my $test_status = Process::Status->new;
+
+  if ($opt->cover) {
+    # The coverage tool captures relative to the checkout root.
+    chdir $repo_root or die "can't chdir to $repo_root: $!";
+
+    my $cover_dir = $opt->cover_dir;
+
+    system('coverage', $cover_dir, @$args ? "@$args" : 'All tests');
+    Process::Status->assert_ok('coverage');
+
+    say "Coverage report in file://$repo_root/$cover_dir/index.html";
+  }
+
+  # Deferred until after the coverage report, because a failing test still
+  # exercised code and that run is often exactly the one worth looking at.
+  $test_status->assert_ok('Cassandane run');
 }
 
 1;
